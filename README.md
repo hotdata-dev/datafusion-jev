@@ -141,7 +141,8 @@ each row must be judged in complete isolation.
 
 - **NULL text** returns NULL without calling the service.
 - **Repeated text** is asked once and the answer is copied to every matching row.
-  A constant like `prompt_jev('hello', ...)` costs one request no matter how many rows.
+  Dedup works within each batch of up to 256 rows, so a constant like
+  `prompt_jev('hello', ...)` costs about one request per 256 rows scanned.
 - **Repeated calls** with identical arguments in one query are evaluated once.
   Reading several fields from one result does not repeat the request.
 - **Limits.** Each row's text may be up to 64 KiB after JSON encoding. Longer text
