@@ -44,7 +44,7 @@ impl PhysicalOptimizerRule for DeduplicateJev {
                     .downcast_ref::<ScalarFunctionExpr>()
                     .is_some_and(|f| f.fun().name() == "__datafusion_jev");
                 let existing = if is_jev {
-                    unique.iter().position(|x| x.func == expr.func.clone())
+                    unique.iter().position(|x| x.func.eq(&expr.func))
                 } else {
                     None
                 };

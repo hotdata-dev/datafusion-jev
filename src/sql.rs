@@ -78,21 +78,43 @@ fn criteria(e: &Expr) -> Result<Vec<Criterion>> {
             "prompt_jev criteria must be a constant array"
         ));
     };
-    a.elem.iter().map(|e| {
-        if let Expr::Dictionary(fields) = e {
-            let mut label = None; let mut description = None; let mut seen = HashSet::new();
+    a.elem
+        .iter()
+        .map(|e| {
+            let Expr::Dictionary(fields) = e else {
+                return Ok(Criterion {
+                    label: string(e)?,
+                    description: None,
+                });
+            };
+            let mut label = None;
+            let mut description = None;
+            let mut seen = HashSet::new();
             for field in fields {
                 let key = field.key.value.as_str();
-                if !seen.insert(key) { return Err(plan_datafusion_err!("duplicate criterion field")); }
+                if !seen.insert(key) {
+                    return Err(plan_datafusion_err!("duplicate criterion field"));
+                }
                 match key {
                     "label" => label = Some(string(&field.value)?),
-                    "description" => { if !matches!(field.value.as_ref(), Expr::Value(v) if v.value == Value::Null) { description=Some(string(&field.value)?); } },
+                    "description" => {
+                        let null = matches!(
+                            field.value.as_ref(),
+                            Expr::Value(v) if v.value == Value::Null
+                        );
+                        if !null {
+                            description = Some(string(&field.value)?);
+                        }
+                    }
                     _ => return Err(plan_datafusion_err!("unknown criterion field: {key}")),
                 }
             }
-            Ok(Criterion { label: label.ok_or_else(|| plan_datafusion_err!("criterion requires label"))?, description })
-        } else { Ok(Criterion { label: string(e)?, description: None }) }
-    }).collect()
+            Ok(Criterion {
+                label: label.ok_or_else(|| plan_datafusion_err!("criterion requires label"))?,
+                description,
+            })
+        })
+        .collect()
 }
 /// Call after parsing and before DataFusion plans the statement. Idempotent.
 pub fn rewrite_statement(statement: &mut ast::Statement) -> Result<()> {
