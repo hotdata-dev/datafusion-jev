@@ -15,6 +15,7 @@ use datafusion::{
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     hash::{Hash, Hasher},
     sync::Arc,
     time::Duration,
@@ -103,6 +104,18 @@ fn datatype(q: &Question) -> DataType {
         DataType::Struct(fields(q))
     }
 }
+/// Text input, including dictionary-encoded text: low-cardinality columns are a
+/// common shape for the categorical text callers feed to inference.
+fn is_text(t: &DataType) -> bool {
+    match t {
+        DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Null => true,
+        DataType::Dictionary(_, inner) => matches!(
+            inner.as_ref(),
+            DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+        ),
+        _ => false,
+    }
+}
 impl ScalarUDFImpl for Jev {
     fn name(&self) -> &str {
         "__datafusion_jev"
@@ -116,12 +129,7 @@ impl ScalarUDFImpl for Jev {
         ))
     }
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
-        if args.arg_fields.len() != 2
-            || !matches!(
-                args.arg_fields[0].data_type(),
-                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 | DataType::Null
-            )
-        {
+        if args.arg_fields.len() != 2 || !is_text(args.arg_fields[0].data_type()) {
             return Err(plan_datafusion_err!("prompt_jev input must be text"));
         }
         let q =
@@ -190,7 +198,10 @@ fn answer(q: &Question, value: &Value) -> Result<ScalarValue> {
         values.push(ScalarValue::Float64(Some(probability)));
         entries.push(scalar_struct(pfields.clone(), values)?);
     }
-    if (sum - 1.0).abs() > 0.01 {
+    // Providers round each probability independently, so the error a valid
+    // answer can accumulate grows with the number of criteria.
+    let tolerance = (0.01 + 0.001 * q.criteria.len() as f64).min(0.3);
+    if (sum - 1.0).abs() > tolerance {
         return Err(exec_datafusion_err!("Jev probabilities do not sum to one"));
     }
     let decision = if q.kind == "choice" {
@@ -219,10 +230,17 @@ fn question_json(q: &Question) -> Value {
     let mut v = json!({"type":q.kind,"instructions":q.instructions});
     if !q.criteria.is_empty() {
         v["criteria"] = if q.kind == "score" {
+            // Score criteria are an ordered array of strings; the provider has no
+            // documented object form that carries a separate label. Keep the array
+            // shape and fold the label into the text, so the caller's label still
+            // reaches the model instead of being replaced by the description.
             Value::Array(
                 q.criteria
                     .iter()
-                    .map(|c| json!(c.description.as_ref().unwrap_or(&c.label)))
+                    .map(|c| match &c.description {
+                        Some(d) => json!(format!("{}: {d}", c.label)),
+                        None => json!(c.label),
+                    })
                     .collect(),
             )
         } else {
@@ -243,19 +261,32 @@ fn question_json(q: &Question) -> Value {
 }
 fn request_body(q: &Question, rows: &[(usize, String)]) -> Value {
     if rows.len() == 1 {
-        return json!({"model":"jev-latest", "state":rows[0].1, "questions":{"row_0":question_json(q)}});
+        return json!({
+            "model": "jev-latest",
+            "state": rows[0].1,
+            "questions": {"row_0": question_json(q)},
+        });
     }
     let state: serde_json::Map<String, Value> = rows
         .iter()
         .enumerate()
         .map(|(i, (_, s))| (format!("row_{i}"), json!(s)))
         .collect();
-    let questions: serde_json::Map<String,Value>=rows.iter().enumerate().map(|(i,_)|{
-        let mut question=question_json(q);
-        question["instructions"]=json!({"question":q.instructions,"scope":format!("Evaluate only the text in state.row_{i}. Other rows are unrelated inputs.")});
-        (format!("row_{i}"),question)
-    }).collect();
-    json!({"model":"jev-latest","state":state,"questions":questions})
+    let questions: serde_json::Map<String, Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let mut question = question_json(q);
+            question["instructions"] = json!({
+                "question": q.instructions,
+                "scope": format!(
+                    "Evaluate only the text in state.row_{i}. Other rows are unrelated inputs."
+                ),
+            });
+            (format!("row_{i}"), question)
+        })
+        .collect();
+    json!({"model": "jev-latest", "state": state, "questions": questions})
 }
 impl Jev {
     async fn batch(
@@ -263,26 +294,32 @@ impl Jev {
         q: &Question,
         rows: Vec<(usize, String)>,
     ) -> Result<Vec<(usize, ScalarValue)>> {
-        let _permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| exec_datafusion_err!("Jev inference closed"))?;
         let body = request_body(q, &rows);
-        // Bound the encoded request too: JSON escaping can expand input substantially.
+        // Backstop only: rows are already split by encoded size, so a single-row
+        // batch cannot reach this limit through input length alone.
         if serde_json::to_vec(&body)
             .map_err(|_| exec_datafusion_err!("invalid Jev request"))?
             .len()
             > 256 * 1024
         {
-            return Err(exec_datafusion_err!(
-                "Jev request exceeds 256 KiB; reduce batch_size or input length"
-            ));
+            let hint = if rows.len() > 1 {
+                "reduce batch_size or shorten the instructions"
+            } else {
+                "shorten the instructions"
+            };
+            return Err(exec_datafusion_err!("Jev request exceeds 256 KiB; {hint}"));
         }
         for attempt in 0..3 {
-            let result =
+            // Hold a permit only while a request is in flight, never across backoff.
+            let result = {
+                let _permit = self
+                    .permits
+                    .acquire()
+                    .await
+                    .map_err(|_| exec_datafusion_err!("Jev inference closed"))?;
                 tokio::time::timeout(Duration::from_secs(30), self.client.request(body.clone()))
-                    .await;
+                    .await
+            };
             match result {
                 Ok(Ok(response)) => {
                     let answers = response["answers"]
@@ -332,10 +369,15 @@ impl AsyncScalarUDFImpl for Jev {
         if len == 0 {
             return Ok(ColumnarValue::Array(new_empty_array(&datatype(&q))));
         }
-        let input = args.args[0].to_array(len)?;
-        let mut batches = vec![];
-        let mut batch = vec![];
-        let mut bytes = 0;
+        let mut input = args.args[0].to_array(len)?;
+        if matches!(input.data_type(), DataType::Dictionary(_, _)) {
+            input = datafusion::arrow::compute::cast(&input, &DataType::Utf8)?;
+        }
+        // Ask about each distinct text once. Repeated and constant inputs are
+        // common, and the answer is copied back to every row that shared the text.
+        let mut unique: Vec<(String, usize)> = vec![];
+        let mut rows_for: Vec<Vec<usize>> = vec![];
+        let mut seen: HashMap<String, usize> = HashMap::new();
         for i in 0..len {
             if input.data_type() == &DataType::Null || input.is_null(i) {
                 continue;
@@ -346,15 +388,33 @@ impl AsyncScalarUDFImpl for Jev {
                 | ScalarValue::LargeUtf8(Some(s)) => s,
                 _ => return Err(exec_datafusion_err!("prompt_jev input must be text")),
             };
-            if s.len() > 64 * 1024 {
-                return Err(exec_datafusion_err!("prompt_jev input exceeds 64 KiB"));
+            if let Some(&u) = seen.get(&s) {
+                rows_for[u].push(i);
+                continue;
             }
-            if !batch.is_empty() && (batch.len() >= q.batch_size || bytes + s.len() > 32 * 1024) {
+            // Measure what actually travels: JSON escaping can expand text severalfold.
+            let encoded = serde_json::to_string(&s)
+                .map_err(|_| exec_datafusion_err!("invalid Jev request"))?
+                .len();
+            if encoded > 64 * 1024 {
+                return Err(exec_datafusion_err!(
+                    "prompt_jev input exceeds 64 KiB once JSON-encoded"
+                ));
+            }
+            seen.insert(s.clone(), unique.len());
+            unique.push((s, encoded));
+            rows_for.push(vec![i]);
+        }
+        let mut batches = vec![];
+        let mut batch = vec![];
+        let mut bytes = 0;
+        for (u, (s, encoded)) in unique.into_iter().enumerate() {
+            if !batch.is_empty() && (batch.len() >= q.batch_size || bytes + encoded > 32 * 1024) {
                 batches.push(std::mem::take(&mut batch));
                 bytes = 0;
             }
-            bytes += s.len();
-            batch.push((i, s));
+            bytes += encoded;
+            batch.push((u, s));
         }
         if !batch.is_empty() {
             batches.push(batch);
@@ -363,8 +423,10 @@ impl AsyncScalarUDFImpl for Jev {
         let mut pending =
             stream::iter(batches.into_iter().map(|rows| self.batch(&q, rows))).buffer_unordered(8);
         while let Some(result) = pending.next().await {
-            for (i, value) in result? {
-                out[i] = value;
+            for (u, value) in result? {
+                for &row in &rows_for[u] {
+                    out[row] = value.clone();
+                }
             }
         }
         Ok(ColumnarValue::Array(ScalarValue::iter_to_array(out)?))

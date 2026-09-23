@@ -1,6 +1,11 @@
 # datafusion-jev
 
-Typed Jev decisions in DataFusion 55 SQL. A standalone extension crate; the host supplies the authenticated HTTP client.
+Ask questions about your text from SQL. `prompt_jev` sends each row to the Jev
+inference service and returns a typed answer: a probability, a choice from a list
+you define, or a score on a scale you define.
+
+Works with DataFusion 55. You bring the HTTP client and API key; the crate handles
+the SQL syntax, batching, retries, and result types.
 
 ```sql
 SELECT conversation_id,
@@ -14,38 +19,162 @@ SELECT conversation_id,
 FROM customer_conversations;
 ```
 
-## SQL interface
+## Setup
 
-- `prompt_jev(text, 'question')`: a nullable `DOUBLE` between 0 and 1 (`noul`).
-- `choice := ['a', 'b']`: struct with `choice`, `probabilities`, `confidence`.
-- `score := ['low', 'medium', 'high']`: struct with weighted `score` (0–2 here), `probabilities`, `confidence`.
-- Criteria also accept `{label: '...', description: '...'}` literals. Descriptions may be NULL.
-- `noul := [...]` may attach descriptions to exactly `true` and `false`.
-- `batch_size := 1..64`, default 32. Only input varies per row; instructions and options currently require SQL literals, not computed constant expressions.
-- Choice requires 2–255 unique labels; score requires 2–10. These modes are mutually exclusive.
+Add the crate to your project, then follow three steps.
 
-Choice probabilities are `STRUCT(value VARCHAR, probability DOUBLE)[]`, in caller order. Score probabilities additionally have `index UINTEGER`. Confidence is the provider's confidence, not a locally inferred value.
+**1. Provide the HTTP client.** Implement `JevClient` with whatever HTTP library
+you already use. POST the request body as JSON to
+`https://api.typesafe.ai/v1/systemone` with your API key in a header, and return
+the parsed JSON response. Keep the key on the server; it never appears in SQL.
 
-This first version supports single-question calls. `questions := ...` and the JSON configuration escape hatch are not implemented. It follows MotherDuck's public interface for the supported subset; it is not MotherDuck code.
+```rust
+use datafusion_jev::{JevClient, RequestError};
 
-## Host integration
+#[derive(Debug)]              // must not print the API key
+struct MyClient { /* http client, api key */ }
 
-1. Implement `JevClient::request(Value)` using your existing HTTP transport. POST the JSON to `https://api.typesafe.ai/v1/systemone`, authenticate with a server-side API key, and return the parsed response. Apply your outbound policy; never put credentials in SQL. Distinguish retryable `Unavailable` from `Fatal` configuration/protocol errors.
-2. Call `datafusion_jev::register(&ctx, Arc::new(client))` once per client scope.
-3. Parse the user's SQL, call `datafusion_jev::rewrite(&mut datafusion_statement)` (which also handles EXPLAIN), and pass the rewritten AST to `SessionState::statement_to_plan`.
+#[async_trait::async_trait]
+impl JevClient for MyClient {
+    async fn request(&self, body: serde_json::Value) -> Result<serde_json::Value, RequestError> {
+        // Send `body`. Map the outcome:
+        //   2xx           -> Ok(parsed JSON)
+        //   5xx / network -> Err(RequestError::Unavailable)   (retried)
+        //   4xx / other   -> Err(RequestError::Fatal(reason))  (fails the query)
+        todo!()
+    }
+}
+```
 
-The extension uses DataFusion's `AsyncScalarUDF`; it does not replace the host's query planner. Registration appends a physical optimizer rule that deduplicates repeated Jev expressions within an async execution node, preserving all output slots. SQL lowering preserves the input expression and encodes validated options as a constant. The private `__datafusion_jev` function is an implementation detail.
+**2. Register it once per session.**
 
-The host is responsible for credentials, authorization to use paid inference, endpoint configuration, HTTP status classification, usage accounting, and response-size limits. `Debug` implementations of clients must redact credentials. No live requests or credentials are required by this crate's tests.
+```rust
+let ctx = SessionContext::new();
+datafusion_jev::register(&ctx, Arc::new(MyClient::new()));
+```
 
-## Execution and failures
+**3. Run queries through `datafusion_jev::sql`.**
 
-- Up to eight requests execute concurrently per registration, shared across partitions and queries. Futures are awaited inline and are dropped on query cancellation.
-- Input is evaluated in bounded batches of at most 256 rows. NULL input skips inference and returns NULL.
-- Batches share a state object and use a separately scoped question for each row. This can affect predictions: choose `batch_size := 1` for isolated state per row.
-- Input is capped at 64 KiB per row; encoded requests at 256 KiB. Requests use `jev-latest`.
-- Transient failures get three attempts with a 30-second timeout per attempt and bounded backoff. Exhaustion returns NULL for affected rows. Invalid configuration, authentication, or malformed answers fail the query.
-- No persistent result cache: materialize results using the host's result-to-table facility when you want to reuse them without inference.
+```rust
+let df = datafusion_jev::sql(&ctx, "SELECT prompt_jev(body, 'Is this urgent?') FROM tickets").await?;
+```
+
+Use this in place of `ctx.sql`. It accepts the same SQL and returns the same
+`DataFrame`, and `sql_with_options` takes DataFusion's `SQLOptions` just like
+`ctx.sql_with_options`. Plain `ctx.sql` does not understand the `prompt_jev`
+options syntax and will fail on it.
+
+If your application already parses SQL itself, call `datafusion_jev::rewrite` on
+the parsed statement before planning it instead.
+
+## Writing queries
+
+`prompt_jev(text, 'question', options...)`. The text can be any column or
+expression. The question and all options must be literals.
+
+### Yes/no probability (default)
+
+```sql
+SELECT prompt_jev(body, 'Is the customer asking for a refund?') AS p FROM tickets
+```
+
+Returns a `DOUBLE` from 0 to 1. Use it directly in filters:
+
+```sql
+WHERE prompt_jev(body, 'Is this urgent?') > 0.8
+```
+
+Optionally describe what `true` and `false` mean:
+
+```sql
+noul := [{label: 'true', description: 'Explicitly requests money back'},
+         {label: 'false', description: 'Anything else'}]
+```
+
+### Pick one option
+
+```sql
+SELECT prompt_jev(body, 'What is this about?', choice := ['billing', 'technical', 'sales']) AS c
+FROM tickets
+```
+
+Returns a struct. Read its fields with dot syntax:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `c.choice` | `VARCHAR` | The selected label |
+| `c.confidence` | `DOUBLE` | How sure the model is, 0 to 1 |
+| `c.probabilities` | list of `{value, probability}` | One entry per option, in the order you listed them |
+
+Two to 255 options. Labels must be unique. Each option can be a plain string or
+`{label: '...', description: '...'}`.
+
+### Score on a scale
+
+```sql
+SELECT prompt_jev(body, 'How severe is the problem?', score := ['low', 'medium', 'high']) AS s
+FROM tickets
+```
+
+Returns a struct like `choice`, except the answer is a number:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `s.score` | `DOUBLE` | Expected position on the scale. With three levels, 0 = low, 2 = high, 1.5 = between medium and high |
+| `s.confidence` | `DOUBLE` | How sure the model is, 0 to 1 |
+| `s.probabilities` | list of `{index, value, probability}` | One entry per level, in order |
+
+Two to 10 levels, listed from lowest to highest. `choice` and `score` cannot be
+combined in one call.
+
+### Batching
+
+```sql
+prompt_jev(body, 'question', batch_size := 8)
+```
+
+Up to 64 rows are sent per request, default 32. Rows in the same request share
+context, which can occasionally influence answers. Use `batch_size := 1` when
+each row must be judged in complete isolation.
+
+## What to expect
+
+- **NULL text** returns NULL without calling the service.
+- **Repeated text** is asked once and the answer is copied to every matching row.
+  A constant like `prompt_jev('hello', ...)` costs one request no matter how many rows.
+- **Repeated calls** with identical arguments in one query are evaluated once.
+  Reading several fields from one result does not repeat the request.
+- **Limits.** Each row's text may be up to 64 KiB after JSON encoding. Longer text
+  fails the query. Requests are capped at 256 KiB.
+- **Outages.** Each request is tried three times with a 30-second timeout. If all
+  fail, the affected rows return NULL and the query completes. Bad credentials,
+  invalid options, or a malformed reply fail the query instead.
+- **Concurrency.** At most eight requests are in flight at a time per registered
+  client, across all queries.
+- **Cancelling** a query cancels its in-flight requests.
+- **No caching.** Every query calls the service again. Store results in a table
+  when you want to reuse them.
+- **Dialects.** The `:=` and `{label: ...}` syntax works with DataFusion's default
+  dialect and with DuckDB. If your session is set to PostgreSQL or MySQL,
+  `prompt_jev` queries fail with an error that says so.
+
+Text columns may be `Utf8`, `LargeUtf8`, `Utf8View`, or dictionary-encoded.
+
+## Compatibility
+
+The SQL interface follows MotherDuck's public `prompt_jev` for the supported
+subset. This is not MotherDuck code. Multi-question calls (`questions := ...`)
+and the JSON configuration form are not implemented yet.
+
+## How it works
+
+`prompt_jev` is rewritten at parse time into a private async scalar function
+whose options are a validated constant. Inference runs through DataFusion's
+`AsyncScalarUDF`, so no blocking threads are involved. A physical optimizer rule
+collapses repeated identical calls in one projection into a single evaluation.
+
+Your application stays in charge of credentials, who may run paid inference,
+endpoint configuration, and usage accounting.
 
 ## Development
 
@@ -55,4 +184,5 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Tests execute real DataFusion plans against a mock provider, covering the public syntax, result fields, batching, NULLs, filtering, and error behavior.
+Tests run real DataFusion plans against a mock service. No network access or
+credentials are needed.
