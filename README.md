@@ -154,7 +154,8 @@ each row must be judged in complete isolation.
   applied before inference, so `WHERE region = 'eu' AND prompt_jev(...) > 0.8`
   only asks about the `eu` rows.
 - **Limits.** Each row's text may be up to 64 KiB after JSON encoding. Longer text
-  fails the query. Requests are capped at 256 KiB.
+  fails the query. Requests are capped at 256 KiB. Questions may be up to 4,000
+  characters, labels 256, and descriptions 1,024.
 - **Outages.** Each request is tried three times with a 30-second timeout. If all
   fail, the affected rows return NULL and the query completes. Bad credentials,
   invalid options, or a malformed reply fail the query instead.
