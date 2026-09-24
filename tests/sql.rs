@@ -778,3 +778,75 @@ async fn two_sided_join_condition_is_a_clear_planning_error() {
     assert!(!err.contains("called directly"), "{err}");
     assert!(mock.calls.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn cheap_conjuncts_filter_rows_before_inference() {
+    // `WHERE id = 1 AND prompt_jev(...) > 0.5` must not send rows 2 and 3.
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "SELECT id FROM (VALUES (1,'keep'),(2,'drop'),(3,'drop')) t(id, body) \
+         WHERE id = 1 AND prompt_jev(body, 'Urgent?') > 0.5",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["questions"].as_object().unwrap().len(),
+        1,
+        "only the row passing the cheap predicate is asked about: {}",
+        calls[0]
+    );
+}
+
+#[tokio::test]
+async fn cheap_conjunct_in_a_count_filter_runs_first() {
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "SELECT count(*) AS n FROM (VALUES ('a','x'),('b','y'),('c','z')) t(name, body) \
+         WHERE name <> 'c' AND prompt_jev(body, 'Urgent?') > 0.5",
+    )
+    .await
+    .unwrap();
+    assert!(display(&result).contains('2'), "{}", display(&result));
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|c| c["questions"].as_object().unwrap().len())
+            .sum::<usize>(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_folded_limit_survives_the_filter_split() {
+    // With one partition, LimitPushdown folds LIMIT into the FilterExec's fetch.
+    // The split must keep it, or the query returns every matching row.
+    let mock = Arc::new(Mock::default());
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    datafusion_jev::register(&ctx, mock.clone());
+    let df = datafusion_jev::sql(
+        &ctx,
+        "SELECT id FROM (VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')) t(id, body) \
+         WHERE id > 1 AND prompt_jev(body, 'Urgent?') > 0.5 LIMIT 1",
+    )
+    .await
+    .unwrap();
+    let result = df.collect().await.unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let asked: usize = mock
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c["questions"].as_object().unwrap().len())
+        .sum();
+    assert!(
+        asked <= 3,
+        "rows failing `id > 1` must not be asked about: {asked}"
+    );
+}
