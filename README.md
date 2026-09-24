@@ -145,6 +145,11 @@ each row must be judged in complete isolation.
   `prompt_jev('hello', ...)` costs about one request per 256 rows scanned.
 - **Repeated calls** with identical arguments in one query are evaluated once.
   Reading several fields from one result does not repeat the request.
+- **Anywhere in a query.** `prompt_jev` works in `SELECT`, `WHERE`, `ORDER BY`,
+  `GROUP BY`, `HAVING`, window `OVER (...)` clauses, and join conditions. A call
+  in a join condition must use columns from one side of the join only.
+- **Filters run first.** Rows removed by `WHERE` are never sent to the service,
+  including when the call sits inside a CTE or subquery.
 - **Limits.** Each row's text may be up to 64 KiB after JSON encoding. Longer text
   fails the query. Requests are capped at 256 KiB.
 - **Outages.** Each request is tried three times with a 30-second timeout. If all

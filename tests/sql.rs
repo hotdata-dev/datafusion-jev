@@ -664,3 +664,117 @@ async fn strict_dialect_gets_a_clear_error() {
         .to_string();
     assert!(!plain.contains("prompt_jev"), "{plain}");
 }
+
+#[tokio::test]
+async fn order_by_prompt_jev_is_hoisted_and_planned() {
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "SELECT id FROM (VALUES (1,'a'),(2,'b'),(3,'c')) t(id, body) \
+         ORDER BY prompt_jev(body, 'Urgent?') DESC, id LIMIT 2",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    assert_eq!(mock.calls.lock().unwrap().len(), 1, "one batched request");
+}
+
+#[tokio::test]
+async fn window_over_prompt_jev_is_hoisted_and_planned() {
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "SELECT id, rank() OVER (ORDER BY prompt_jev(body, 'Urgent?') DESC) AS rk \
+         FROM (VALUES (1,'a'),(2,'b'),(3,'c')) t(id, body) ORDER BY rk, id",
+    )
+    .await
+    .unwrap();
+    let text = display(&result);
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    assert!(text.contains("rk"), "{text}");
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn filter_runs_before_inference_when_a_field_is_read_through_a_cte() {
+    // DataFusion's leaf pushdown would otherwise move get_field(k, 'choice') and
+    // the call it wraps beneath the filter, sending every row to the provider.
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "WITH c AS (SELECT id, prompt_jev(body, 'Topic?', choice := ['a','b']) AS k \
+                    FROM (VALUES (1,'keep'),(2,'drop'),(3,'drop')) t(id, body) WHERE id = 1) \
+         SELECT id, k.choice FROM c",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]["questions"].as_object().unwrap().len(),
+        1,
+        "only the row that passed the filter is asked about: {}",
+        calls[0]
+    );
+}
+
+#[tokio::test]
+async fn leaf_pushdown_still_runs_for_queries_without_prompt_jev() {
+    // The guard must not disable DataFusion's optimization for ordinary queries.
+    let ctx = SessionContext::new();
+    datafusion_jev::register(&ctx, Arc::new(Mock::default()));
+    let df = datafusion_jev::sql(
+        &ctx,
+        "EXPLAIN VERBOSE SELECT s.x FROM (SELECT struct(id AS x) AS s FROM (VALUES (1),(2)) t(id) WHERE id = 1) q",
+    )
+    .await
+    .unwrap();
+    let text = display(&df.collect().await.unwrap());
+    assert!(text.contains("__datafusion_extracted"), "{text}");
+}
+
+#[tokio::test]
+async fn group_by_prompt_jev_is_planned() {
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "SELECT round(prompt_jev(body, 'Urgent?'), 1) AS p, count(*) AS n \
+         FROM (VALUES (1,'a'),(2,'b'),(3,'c')) t(id, body) GROUP BY 1 ORDER BY 1",
+    )
+    .await
+    .unwrap();
+    assert!(result.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn one_sided_join_condition_with_prompt_jev_is_hoisted() {
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "SELECT a.id FROM (VALUES (1,'x'),(2,'y')) a(id, body) JOIN (VALUES (1),(2)) b(id) \
+         ON a.id = b.id AND prompt_jev(a.body, 'Urgent?') > 0.5 ORDER BY a.id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn two_sided_join_condition_is_a_clear_planning_error() {
+    let mock = Arc::new(Mock::default());
+    let err = run(
+        mock.clone(),
+        "SELECT a.id FROM (VALUES (1,'x')) a(id, body) JOIN (VALUES (1,'y')) b(id, body) \
+         ON a.id = b.id AND prompt_jev(a.body || b.body, 'Same?') > 0.5",
+    )
+    .await
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("one side only"), "{err}");
+    assert!(!err.contains("called directly"), "{err}");
+    assert!(mock.calls.lock().unwrap().is_empty());
+}

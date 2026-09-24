@@ -7,6 +7,7 @@
 //!
 //! See the README for the SQL syntax and result types.
 mod optimizer;
+mod planner;
 pub mod sql;
 mod udf;
 use async_trait::async_trait;
@@ -43,7 +44,23 @@ pub fn register(ctx: &SessionContext, client: Arc<dyn JevClient>) {
     ctx.register_udf(udf::function(client));
     let state_ref = ctx.state_ref();
     let mut state = state_ref.write();
+    // Keep DataFusion's optimizer list as is, except that the two leaf-pushdown
+    // rules are skipped for plans calling prompt_jev (see `planner`).
+    let optimizer_rules = state
+        .optimizer()
+        .rules
+        .iter()
+        .map(|rule| {
+            if planner::LeafPushdownGuard::GUARDED.contains(&rule.name()) {
+                planner::LeafPushdownGuard::wrap(Arc::clone(rule))
+            } else {
+                Arc::clone(rule)
+            }
+        })
+        .collect();
     *state = datafusion::execution::SessionStateBuilder::new_from_existing(state.clone())
+        .with_analyzer_rule(Arc::new(planner::HoistJev))
+        .with_optimizer_rules(optimizer_rules)
         .with_physical_optimizer_rule(Arc::new(optimizer::DeduplicateJev))
         .build();
 }
