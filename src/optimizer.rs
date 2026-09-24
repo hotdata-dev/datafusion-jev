@@ -1,13 +1,16 @@
-//! Physical-plan rules around DataFusion 55's `AsyncFuncExec`.
+//! Physical-plan rules around DataFusion 55's `AsyncFuncExec`, both of which
+//! remove inference the query does not need.
 //!
-//! * [`DeduplicateJev`]: DataFusion extracts every occurrence of an async
-//!   function, including repeated struct field access. Keep one Jev evaluation
-//!   and project its result into the original slots so downstream column
-//!   indices remain valid.
-//! * [`FilterBeforeJev`]: a `WHERE cheap AND prompt_jev(...) > x` is planned as
-//!   one filter above the async node, so every row is sent for inference before
-//!   either conjunct runs. Split it so the conjuncts that need no inference run
-//!   first, beneath the async node.
+//! * [`FilterBeforeJev`] splits a filter that sits above the async node into
+//!   the conjuncts that need no inference and the rest, and runs the cheap ones
+//!   beneath the node. `WHERE cheap AND prompt_jev(...) > x` is otherwise
+//!   planned as one filter above the node, so every row is sent for inference
+//!   before either conjunct runs.
+//! * [`DeduplicateJev`] keeps one evaluation of each distinct call and projects
+//!   its result into the original slots, so downstream column indices stay
+//!   valid. DataFusion extracts every occurrence of an async function,
+//!   including repeated struct field access.
+use crate::names::{async_exprs, is_jev_expr};
 use datafusion::{
     common::{
         Result,
@@ -15,8 +18,8 @@ use datafusion::{
     },
     config::ConfigOptions,
     physical_expr::{
-        PhysicalExpr, ScalarFunctionExpr, conjunction, expressions::Column, split_conjunction,
-        utils::collect_columns,
+        PhysicalExpr, async_scalar_function::AsyncFuncExpr, conjunction, expressions::Column,
+        split_conjunction, utils::collect_columns,
     },
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
@@ -29,9 +32,11 @@ use datafusion::{
 };
 use std::sync::Arc;
 
-fn is_jev_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    expr.downcast_ref::<ScalarFunctionExpr>()
-        .is_some_and(|f| f.fun().name() == "__datafusion_jev")
+/// The async node and the expressions it evaluates, or `None` when `plan` is
+/// some other node. Both rules start here.
+fn async_node(plan: &Arc<dyn ExecutionPlan>) -> Option<(&AsyncFuncExec, &[Arc<AsyncFuncExpr>])> {
+    let node = plan.downcast_ref::<AsyncFuncExec>()?;
+    Some((node, async_exprs(node)))
 }
 
 #[derive(Debug)]
@@ -62,11 +67,9 @@ impl PhysicalOptimizerRule for FilterBeforeJev {
                 passthrough.push(cursor);
                 cursor = child;
             }
-            let Some(node) = cursor.downcast_ref::<AsyncFuncExec>() else {
+            let Some((node, async_exprs)) = async_node(&cursor) else {
                 return Ok(Transformed::no(plan));
             };
-            #[allow(deprecated)]
-            let async_exprs = node.async_exprs();
             if !async_exprs.iter().any(|e| is_jev_expr(&e.func)) {
                 return Ok(Transformed::no(plan));
             }
@@ -126,23 +129,13 @@ impl PhysicalOptimizerRule for DeduplicateJev {
         _: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|plan| {
-            let Some(node) = plan.downcast_ref::<AsyncFuncExec>() else {
+            let Some((node, expressions)) = async_node(&plan) else {
                 return Ok(Transformed::no(plan));
             };
-            // DF deprecated this accessor without a replacement. We need it to
-            // avoid duplicate paid inference while preserving the output schema.
-            #[allow(deprecated)]
-            let expressions = node.async_exprs();
-            let mut unique: Vec<
-                Arc<datafusion::physical_expr::async_scalar_function::AsyncFuncExpr>,
-            > = vec![];
+            let mut unique: Vec<Arc<AsyncFuncExpr>> = vec![];
             let mut indices = vec![];
             for expr in expressions {
-                let is_jev = expr
-                    .func
-                    .downcast_ref::<ScalarFunctionExpr>()
-                    .is_some_and(|f| f.fun().name() == "__datafusion_jev");
-                let existing = if is_jev {
+                let existing = if is_jev_expr(&expr.func) {
                     unique.iter().position(|x| x.func.eq(&expr.func))
                 } else {
                     None

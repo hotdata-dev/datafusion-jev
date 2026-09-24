@@ -1,8 +1,10 @@
 //! Lower the public SQL syntax to a validated, constant configuration.
+use crate::names::INTERNAL_FUNCTION;
 use datafusion::{
     common::{Result, plan_datafusion_err},
     sql::sqlparser::ast::{
-        self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, Value,
+        self, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+        ObjectName, Value,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -120,7 +122,9 @@ fn criteria(e: &Expr) -> Result<Vec<Criterion>> {
                     return Err(plan_datafusion_err!("duplicate criterion field"));
                 }
                 match key {
-                    "label" => label = Some(string(&field.value)?),
+                    "label" => {
+                        label = Some(string(&field.value)?);
+                    }
                     "description" => {
                         let null = matches!(
                             field.value.as_ref(),
@@ -130,7 +134,9 @@ fn criteria(e: &Expr) -> Result<Vec<Criterion>> {
                             description = Some(string(&field.value)?);
                         }
                     }
-                    _ => return Err(plan_datafusion_err!("unknown criterion field: {key}")),
+                    _ => {
+                        return Err(plan_datafusion_err!("unknown criterion field: {key}"));
+                    }
                 }
             }
             Ok(Criterion {
@@ -139,6 +145,107 @@ fn criteria(e: &Expr) -> Result<Vec<Criterion>> {
             })
         })
         .collect()
+}
+fn parse_batch_size(e: &Expr) -> Result<usize> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+    .ok_or_else(|| plan_datafusion_err!("batch_size must be a constant integer"))
+}
+/// Read one `prompt_jev` call: the input expression and the question it asks.
+/// The question is not validated here; the caller does that before rewriting.
+fn parse_call(f: &mut ast::Function) -> Result<(Expr, Question)> {
+    if f.filter.is_some()
+        || f.over.is_some()
+        || f.null_treatment.is_some()
+        || !f.within_group.is_empty()
+        || !matches!(f.parameters, FunctionArguments::None)
+    {
+        return Err(plan_datafusion_err!(
+            "prompt_jev does not accept aggregate/window modifiers"
+        ));
+    }
+    let FunctionArguments::List(args) = &mut f.args else {
+        return Err(plan_datafusion_err!(
+            "prompt_jev requires input and instructions"
+        ));
+    };
+    if args.duplicate_treatment.is_some() || !args.clauses.is_empty() {
+        return Err(plan_datafusion_err!("invalid prompt_jev modifiers"));
+    }
+    let mut positional = Vec::new();
+    let mut named = HashSet::new();
+    let mut q = Question {
+        instructions: String::new(),
+        kind: "noul".into(),
+        criteria: vec![],
+        batch_size: 32,
+    };
+    let mut mode = false;
+    for arg in &args.args {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if named.is_empty() => {
+                positional.push(e.clone())
+            }
+            FunctionArg::Named {
+                name,
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            } => {
+                let name = if name.quote_style.is_some() {
+                    name.value.clone()
+                } else {
+                    name.value.to_lowercase()
+                };
+                if !named.insert(name.clone()) {
+                    return Err(plan_datafusion_err!(
+                        "duplicate prompt_jev argument: {name}"
+                    ));
+                }
+                match name.as_str() {
+                    "choice" | "score" | "noul" => {
+                        if mode {
+                            return Err(plan_datafusion_err!(
+                                "choice, score, and noul are mutually exclusive"
+                            ));
+                        }
+                        mode = true;
+                        q.kind = name;
+                        q.criteria = criteria(e)?;
+                        if q.kind == "noul" && q.criteria.is_empty() {
+                            return Err(plan_datafusion_err!(
+                                "explicit noul criteria require true and false"
+                            ));
+                        }
+                    }
+                    "batch_size" => {
+                        q.batch_size = parse_batch_size(e)?;
+                    }
+                    _ => {
+                        return Err(plan_datafusion_err!(
+                            "unsupported prompt_jev argument: {name}"
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(plan_datafusion_err!(
+                    "prompt_jev requires two positional arguments followed by named options"
+                ));
+            }
+        }
+    }
+    if positional.len() != 2 {
+        return Err(plan_datafusion_err!(
+            "prompt_jev requires input and constant instructions"
+        ));
+    }
+    q.instructions = string(&positional[1])?;
+    Ok((positional.remove(0), q))
 }
 /// Call after parsing and before DataFusion plans the statement. Idempotent.
 pub fn rewrite_statement(statement: &mut ast::Statement) -> Result<()> {
@@ -158,110 +265,20 @@ pub fn rewrite_statement(statement: &mut ast::Statement) -> Result<()> {
             return ControlFlow::Continue(());
         }
         let result = (|| {
-            if f.filter.is_some()
-                || f.over.is_some()
-                || f.null_treatment.is_some()
-                || !f.within_group.is_empty()
-                || !matches!(f.parameters, FunctionArguments::None)
-            {
-                return Err(plan_datafusion_err!(
-                    "prompt_jev does not accept aggregate/window modifiers"
-                ));
-            }
-            let FunctionArguments::List(args) = &mut f.args else {
-                return Err(plan_datafusion_err!(
-                    "prompt_jev requires input and instructions"
-                ));
-            };
-            if args.duplicate_treatment.is_some() || !args.clauses.is_empty() {
-                return Err(plan_datafusion_err!("invalid prompt_jev modifiers"));
-            }
-            let mut positional = Vec::new();
-            let mut named = HashSet::new();
-            let mut q = Question {
-                instructions: String::new(),
-                kind: "noul".into(),
-                criteria: vec![],
-                batch_size: 32,
-            };
-            let mut mode = false;
-            for arg in &args.args {
-                match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if named.is_empty() => {
-                        positional.push(e.clone())
-                    }
-                    FunctionArg::Named {
-                        name,
-                        arg: FunctionArgExpr::Expr(e),
-                        ..
-                    } => {
-                        let name = if name.quote_style.is_some() {
-                            name.value.clone()
-                        } else {
-                            name.value.to_lowercase()
-                        };
-                        if !named.insert(name.clone()) {
-                            return Err(plan_datafusion_err!(
-                                "duplicate prompt_jev argument: {name}"
-                            ));
-                        }
-                        match name.as_str() {
-                            "choice" | "score" | "noul" => {
-                                if mode {
-                                    return Err(plan_datafusion_err!(
-                                        "choice, score, and noul are mutually exclusive"
-                                    ));
-                                }
-                                mode = true;
-                                q.kind = name;
-                                q.criteria = criteria(e)?;
-                                if q.kind == "noul" && q.criteria.is_empty() {
-                                    return Err(plan_datafusion_err!(
-                                        "explicit noul criteria require true and false"
-                                    ));
-                                }
-                            }
-                            "batch_size" => {
-                                q.batch_size = match e {
-                                    Expr::Value(v) => match &v.value {
-                                        Value::Number(n, _) => n.parse().ok(),
-                                        _ => None,
-                                    },
-                                    _ => None,
-                                }
-                                .ok_or_else(|| {
-                                    plan_datafusion_err!("batch_size must be a constant integer")
-                                })?;
-                            }
-                            _ => {
-                                return Err(plan_datafusion_err!(
-                                    "unsupported prompt_jev argument: {name}"
-                                ));
-                            }
-                        }
-                    }
-                    _ => {
-                        return Err(plan_datafusion_err!(
-                            "prompt_jev requires two positional arguments followed by named options"
-                        ));
-                    }
-                }
-            }
-            if positional.len() != 2 {
-                return Err(plan_datafusion_err!(
-                    "prompt_jev requires input and constant instructions"
-                ));
-            }
-            q.instructions = string(&positional[1])?;
+            let (input, q) = parse_call(f)?;
             q.validate()?;
             let config = serde_json::to_string(&q).map_err(|e| plan_datafusion_err!("{e}"))?;
-            f.name = ObjectName::from(vec![Ident::new("__datafusion_jev")]);
-            args.args = vec![
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(positional.remove(0))),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    Value::SingleQuotedString(config).into(),
-                ))),
-            ];
+            f.name = ObjectName::from(vec![Ident::new(INTERNAL_FUNCTION)]);
+            f.args = FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(input)),
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                        Value::SingleQuotedString(config).into(),
+                    ))),
+                ],
+                clauses: vec![],
+            });
             Ok(())
         })();
         match result {
