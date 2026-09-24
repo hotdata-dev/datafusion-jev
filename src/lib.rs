@@ -6,6 +6,7 @@
 //! 3. Run queries with [`sql()`] instead of `SessionContext::sql`.
 //!
 //! See the README for the SQL syntax and result types.
+mod names;
 mod optimizer;
 mod planner;
 pub mod sql;

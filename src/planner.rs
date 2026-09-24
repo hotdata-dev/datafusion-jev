@@ -1,19 +1,17 @@
-//! Logical-plan adjustments so `prompt_jev` works wherever DataFusion 55 does
-//! not natively plan async functions, and is never evaluated on rows a filter
-//! discards.
+//! Logical-plan rules that keep `prompt_jev` plannable and cheap.
 //!
-//! Two problems, two rules:
-//!
-//! * DataFusion only lifts async calls out of `Projection` and `Filter`. A call
-//!   in an `ORDER BY`, a window `OVER (...)`, a `GROUP BY`, or a join condition
-//!   reaches the synchronous invoke path and fails with "async functions should
-//!   not be called directly". [`HoistJev`] moves such calls into a projection
-//!   beneath the node and refers to them by column.
-//! * DataFusion's leaf-expression pushdown moves `get_field(k, 'x')` through a
-//!   filter and substitutes `k`'s definition without rechecking placement, so a
-//!   `prompt_jev` call ends up below the filter and runs on every row.
-//!   [`LeafPushdownGuard`] skips those two rules for any plan that contains the
-//!   call, and leaves every other plan alone.
+//! * [`HoistJev`] moves a call out of an `ORDER BY`, a window `OVER (...)`, a
+//!   `GROUP BY`, or a join condition into a projection beneath the node and
+//!   refers to it by column. DataFusion 55 only lifts async calls out of
+//!   `Projection` and `Filter`; anywhere else the call reaches the synchronous
+//!   invoke path and fails with "async functions should not be called
+//!   directly".
+//! * [`LeafPushdownGuard`] skips DataFusion's two leaf-expression pushdown
+//!   rules for any plan that contains a call, and leaves every other plan
+//!   alone. Those rules move `get_field(k, 'x')` through a filter and
+//!   substitute `k`'s definition without rechecking placement, which would put
+//!   the call below the filter and run it on every row.
+use crate::names::is_jev;
 use datafusion::{
     common::{
         DFSchema, Result, plan_datafusion_err,
@@ -25,12 +23,7 @@ use datafusion::{
 };
 use std::sync::Arc;
 
-pub const FUNCTION_NAME: &str = "__datafusion_jev";
 const HOIST_PREFIX: &str = "__jev_hoist_";
-
-fn is_jev(expr: &Expr) -> bool {
-    matches!(expr, Expr::ScalarFunction(f) if f.func.name() == FUNCTION_NAME)
-}
 
 fn contains_jev(expr: &Expr) -> bool {
     expr.exists(|e| Ok(is_jev(e))).unwrap_or(false)
@@ -140,15 +133,6 @@ impl AnalyzerRule for HoistJev {
     }
 }
 
-/// Collect each distinct call, project it beneath `input` under a generated
-/// name, and return the new input with the call-to-column substitutions.
-fn hoist_calls(
-    input: Arc<LogicalPlan>,
-    exprs: &[&Expr],
-) -> Result<(LogicalPlan, Vec<(Expr, Expr)>)> {
-    hoist_calls_named(input, exprs, HOIST_PREFIX)
-}
-
 fn collect_calls(exprs: &[&Expr]) -> Result<Vec<Expr>> {
     let mut calls: Vec<Expr> = vec![];
     for expr in exprs {
@@ -163,7 +147,10 @@ fn collect_calls(exprs: &[&Expr]) -> Result<Vec<Expr>> {
     Ok(calls)
 }
 
-fn hoist_calls_named(
+/// Collect each distinct call, project it beneath `input` under a name made
+/// from `prefix`, and return the new input with the call-to-column
+/// substitutions.
+fn hoist_calls(
     input: Arc<LogicalPlan>,
     exprs: &[&Expr],
     prefix: &str,
@@ -213,7 +200,7 @@ fn hoist_sort(sort: Sort) -> Result<LogicalPlan> {
         .map(Expr::Column)
         .collect();
     let keys: Vec<&Expr> = expr.iter().map(|s| &s.expr).collect();
-    let (projected, substitutions) = hoist_calls(input, &keys)?;
+    let (projected, substitutions) = hoist_calls(input, &keys, HOIST_PREFIX)?;
     let expr = expr
         .into_iter()
         .map(|s| Ok(s.with_expr(substitute(s.expr.clone(), &substitutions)?)))
@@ -235,7 +222,7 @@ fn hoist_window(window: Window) -> Result<LogicalPlan> {
     } = window;
     let original: Vec<Expr> = schema.columns().into_iter().map(Expr::Column).collect();
     let refs: Vec<&Expr> = window_expr.iter().collect();
-    let (projected, substitutions) = hoist_calls(input, &refs)?;
+    let (projected, substitutions) = hoist_calls(input, &refs, HOIST_PREFIX)?;
     let window_expr = window_expr
         .into_iter()
         .map(|e| {
@@ -271,7 +258,7 @@ fn hoist_aggregate(agg: Aggregate) -> Result<LogicalPlan> {
         ..
     } = agg;
     let refs: Vec<&Expr> = group_expr.iter().chain(&aggr_expr).collect();
-    let (projected, substitutions) = hoist_calls(input, &refs)?;
+    let (projected, substitutions) = hoist_calls(input, &refs, HOIST_PREFIX)?;
     let group_expr = group_expr
         .into_iter()
         .map(|e| substitute_keeping_name(e, &substitutions))
@@ -323,8 +310,8 @@ fn hoist_join(join: Join) -> Result<LogicalPlan> {
     }
     let left_refs: Vec<&Expr> = left_calls.iter().collect();
     let right_refs: Vec<&Expr> = right_calls.iter().collect();
-    let (left, mut substitutions) = hoist_calls_named(left, &left_refs, "__jev_hoist_l")?;
-    let (right, right_subs) = hoist_calls_named(right, &right_refs, "__jev_hoist_r")?;
+    let (left, mut substitutions) = hoist_calls(left, &left_refs, "__jev_hoist_l")?;
+    let (right, right_subs) = hoist_calls(right, &right_refs, "__jev_hoist_r")?;
     substitutions.extend(right_subs);
     let on = on
         .into_iter()

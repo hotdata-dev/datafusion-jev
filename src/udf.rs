@@ -1,4 +1,4 @@
-use crate::{JevClient, RequestError, sql::Question};
+use crate::{JevClient, RequestError, names::INTERNAL_FUNCTION, sql::Question};
 use async_trait::async_trait;
 use datafusion::{
     arrow::{
@@ -118,7 +118,7 @@ fn is_text(t: &DataType) -> bool {
 }
 impl ScalarUDFImpl for Jev {
     fn name(&self) -> &str {
-        "__datafusion_jev"
+        INTERNAL_FUNCTION
     }
     fn signature(&self) -> &Signature {
         &self.signature
@@ -156,22 +156,9 @@ fn number(value: &Value, upper: f64) -> Result<f64> {
         .filter(|v| v.is_finite() && *v >= 0.0 && *v <= upper)
         .ok_or_else(|| exec_datafusion_err!("Jev returned an invalid numeric answer"))
 }
-fn answer(q: &Question, value: &Value) -> Result<ScalarValue> {
-    if value["type"].as_str() != Some(q.kind.as_str()) {
-        return Err(exec_datafusion_err!(
-            "Jev returned an unexpected answer type"
-        ));
-    }
-    if q.kind == "noul" {
-        return Ok(ScalarValue::Float64(Some(number(&value["noul"], 1.0)?)));
-    }
-    let fs = fields(q);
-    let DataType::List(item) = fs[1].data_type() else {
-        unreachable!()
-    };
-    let DataType::Struct(pfields) = item.data_type() else {
-        unreachable!()
-    };
+/// One struct entry per criterion, in the caller's order, and the sum of their
+/// probabilities.
+fn probabilities(q: &Question, value: &Value, pfields: &Fields) -> Result<(Vec<ScalarValue>, f64)> {
     let probs = value["probabilities"]
         .as_object()
         .ok_or_else(|| exec_datafusion_err!("Jev omitted probabilities"))?;
@@ -198,6 +185,25 @@ fn answer(q: &Question, value: &Value) -> Result<ScalarValue> {
         values.push(ScalarValue::Float64(Some(probability)));
         entries.push(scalar_struct(pfields.clone(), values)?);
     }
+    Ok((entries, sum))
+}
+fn answer(q: &Question, value: &Value) -> Result<ScalarValue> {
+    if value["type"].as_str() != Some(q.kind.as_str()) {
+        return Err(exec_datafusion_err!(
+            "Jev returned an unexpected answer type"
+        ));
+    }
+    if q.kind == "noul" {
+        return Ok(ScalarValue::Float64(Some(number(&value["noul"], 1.0)?)));
+    }
+    let fs = fields(q);
+    let DataType::List(item) = fs[1].data_type() else {
+        unreachable!()
+    };
+    let DataType::Struct(pfields) = item.data_type() else {
+        unreachable!()
+    };
+    let (entries, sum) = probabilities(q, value, pfields)?;
     // Providers round each probability independently, so the error a valid
     // answer can accumulate grows with the number of criteria.
     let tolerance = (0.01 + 0.001 * q.criteria.len() as f64).min(0.3);
@@ -288,6 +294,64 @@ fn request_body(q: &Question, rows: &[(usize, String)]) -> Value {
         .collect();
     json!({"model": "jev-latest", "state": state, "questions": questions})
 }
+/// The requests to make for one input array.
+struct Batches {
+    /// Each request: the distinct texts it asks about, as (text index, text).
+    batches: Vec<Vec<(usize, String)>>,
+    /// For each distinct text, the rows of the input that held it.
+    rows_for: Vec<Vec<usize>>,
+}
+/// Ask about each distinct text once, and group the texts into requests that
+/// respect `batch_size` and the encoded-size budget. Repeated and constant
+/// inputs are common, and the answer is copied back to every row that shared
+/// the text.
+fn plan_batches(input: &ArrayRef, batch_size: usize) -> Result<Batches> {
+    let mut unique: Vec<(String, usize)> = vec![];
+    let mut rows_for: Vec<Vec<usize>> = vec![];
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for i in 0..input.len() {
+        if input.data_type() == &DataType::Null || input.is_null(i) {
+            continue;
+        }
+        let s = match ScalarValue::try_from_array(input, i)? {
+            ScalarValue::Utf8(Some(s))
+            | ScalarValue::Utf8View(Some(s))
+            | ScalarValue::LargeUtf8(Some(s)) => s,
+            _ => return Err(exec_datafusion_err!("prompt_jev input must be text")),
+        };
+        if let Some(&u) = seen.get(&s) {
+            rows_for[u].push(i);
+            continue;
+        }
+        // Measure what actually travels: JSON escaping can expand text severalfold.
+        let encoded = serde_json::to_string(&s)
+            .map_err(|_| exec_datafusion_err!("invalid Jev request"))?
+            .len();
+        if encoded > 64 * 1024 {
+            return Err(exec_datafusion_err!(
+                "prompt_jev input exceeds 64 KiB once JSON-encoded"
+            ));
+        }
+        seen.insert(s.clone(), unique.len());
+        unique.push((s, encoded));
+        rows_for.push(vec![i]);
+    }
+    let mut batches = vec![];
+    let mut batch = vec![];
+    let mut bytes = 0;
+    for (u, (s, encoded)) in unique.into_iter().enumerate() {
+        if !batch.is_empty() && (batch.len() >= batch_size || bytes + encoded > 32 * 1024) {
+            batches.push(std::mem::take(&mut batch));
+            bytes = 0;
+        }
+        bytes += encoded;
+        batch.push((u, s));
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    Ok(Batches { batches, rows_for })
+}
 impl Jev {
     async fn batch(
         &self,
@@ -373,52 +437,7 @@ impl AsyncScalarUDFImpl for Jev {
         if matches!(input.data_type(), DataType::Dictionary(_, _)) {
             input = datafusion::arrow::compute::cast(&input, &DataType::Utf8)?;
         }
-        // Ask about each distinct text once. Repeated and constant inputs are
-        // common, and the answer is copied back to every row that shared the text.
-        let mut unique: Vec<(String, usize)> = vec![];
-        let mut rows_for: Vec<Vec<usize>> = vec![];
-        let mut seen: HashMap<String, usize> = HashMap::new();
-        for i in 0..len {
-            if input.data_type() == &DataType::Null || input.is_null(i) {
-                continue;
-            }
-            let s = match ScalarValue::try_from_array(&input, i)? {
-                ScalarValue::Utf8(Some(s))
-                | ScalarValue::Utf8View(Some(s))
-                | ScalarValue::LargeUtf8(Some(s)) => s,
-                _ => return Err(exec_datafusion_err!("prompt_jev input must be text")),
-            };
-            if let Some(&u) = seen.get(&s) {
-                rows_for[u].push(i);
-                continue;
-            }
-            // Measure what actually travels: JSON escaping can expand text severalfold.
-            let encoded = serde_json::to_string(&s)
-                .map_err(|_| exec_datafusion_err!("invalid Jev request"))?
-                .len();
-            if encoded > 64 * 1024 {
-                return Err(exec_datafusion_err!(
-                    "prompt_jev input exceeds 64 KiB once JSON-encoded"
-                ));
-            }
-            seen.insert(s.clone(), unique.len());
-            unique.push((s, encoded));
-            rows_for.push(vec![i]);
-        }
-        let mut batches = vec![];
-        let mut batch = vec![];
-        let mut bytes = 0;
-        for (u, (s, encoded)) in unique.into_iter().enumerate() {
-            if !batch.is_empty() && (batch.len() >= q.batch_size || bytes + encoded > 32 * 1024) {
-                batches.push(std::mem::take(&mut batch));
-                bytes = 0;
-            }
-            bytes += encoded;
-            batch.push((u, s));
-        }
-        if !batch.is_empty() {
-            batches.push(batch);
-        }
+        let Batches { batches, rows_for } = plan_batches(&input, q.batch_size)?;
         let mut out = vec![ScalarValue::try_from(&datatype(&q))?; len];
         let mut pending =
             stream::iter(batches.into_iter().map(|rows| self.batch(&q, rows))).buffer_unordered(8);
