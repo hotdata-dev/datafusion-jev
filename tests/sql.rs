@@ -821,3 +821,32 @@ async fn cheap_conjunct_in_a_count_filter_runs_first() {
         2
     );
 }
+
+#[tokio::test]
+async fn a_folded_limit_survives_the_filter_split() {
+    // With one partition, LimitPushdown folds LIMIT into the FilterExec's fetch.
+    // The split must keep it, or the query returns every matching row.
+    let mock = Arc::new(Mock::default());
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    datafusion_jev::register(&ctx, mock.clone());
+    let df = datafusion_jev::sql(
+        &ctx,
+        "SELECT id FROM (VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')) t(id, body) \
+         WHERE id > 1 AND prompt_jev(body, 'Urgent?') > 0.5 LIMIT 1",
+    )
+    .await
+    .unwrap();
+    let result = df.collect().await.unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let asked: usize = mock
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c["questions"].as_object().unwrap().len())
+        .sum();
+    assert!(
+        asked <= 3,
+        "rows failing `id > 1` must not be asked about: {asked}"
+    );
+}

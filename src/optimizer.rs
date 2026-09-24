@@ -93,7 +93,12 @@ impl PhysicalOptimizerRule for FilterBeforeJev {
                     ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
                 )?;
             }
+            // Carry the original filter's fetch (LimitPushdown may have folded a
+            // LIMIT into it), batch size, and selectivity onto the rebuilt one.
             let post = FilterExecBuilder::new(conjunction(needs_inference), rebuilt)
+                .with_fetch(filter.fetch())
+                .with_batch_size(filter.batch_size())
+                .with_default_selectivity(filter.default_selectivity())
                 .apply_projection(
                     filter
                         .projection()
