@@ -61,6 +61,7 @@ pub fn register(ctx: &SessionContext, client: Arc<dyn JevClient>) {
     *state = datafusion::execution::SessionStateBuilder::new_from_existing(state.clone())
         .with_analyzer_rule(Arc::new(planner::HoistJev))
         .with_optimizer_rules(optimizer_rules)
+        .with_physical_optimizer_rule(Arc::new(optimizer::FilterBeforeJev))
         .with_physical_optimizer_rule(Arc::new(optimizer::DeduplicateJev))
         .build();
 }
