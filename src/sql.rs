@@ -21,10 +21,23 @@ pub struct Question {
     pub batch_size: usize,
 }
 impl Question {
+    /// Longest instructions accepted, in characters. The provider rejects
+    /// requests well before the crate's request-size cap would, and a plan-time
+    /// error names the actual problem instead of a provider HTTP status.
+    pub const MAX_INSTRUCTION_CHARS: usize = 4_000;
+    pub const MAX_LABEL_CHARS: usize = 256;
+    pub const MAX_DESCRIPTION_CHARS: usize = 1_024;
+
     pub fn validate(&self) -> Result<()> {
         if self.instructions.trim().is_empty() {
             return Err(plan_datafusion_err!(
                 "prompt_jev instructions must not be empty"
+            ));
+        }
+        if self.instructions.chars().count() > Self::MAX_INSTRUCTION_CHARS {
+            return Err(plan_datafusion_err!(
+                "prompt_jev instructions exceed {} characters",
+                Self::MAX_INSTRUCTION_CHARS
             ));
         }
         if !(1..=64).contains(&self.batch_size) {
@@ -40,6 +53,17 @@ impl Question {
             {
                 return Err(plan_datafusion_err!(
                     "prompt_jev criteria require unique non-empty labels and non-empty descriptions"
+                ));
+            }
+            if c.label.chars().count() > Self::MAX_LABEL_CHARS
+                || c.description
+                    .as_ref()
+                    .is_some_and(|d| d.chars().count() > Self::MAX_DESCRIPTION_CHARS)
+            {
+                return Err(plan_datafusion_err!(
+                    "prompt_jev labels are limited to {} characters and descriptions to {}",
+                    Self::MAX_LABEL_CHARS,
+                    Self::MAX_DESCRIPTION_CHARS
                 ));
             }
         }
@@ -122,7 +146,15 @@ pub fn rewrite_statement(statement: &mut ast::Statement) -> Result<()> {
         let Expr::Function(f) = expr else {
             return ControlFlow::Continue(());
         };
-        if f.name.to_string().to_lowercase() != "prompt_jev" {
+        // Match the bare identifier, so `"prompt_jev"(...)` and `PROMPT_JEV(...)`
+        // are the same call; a schema-qualified name is left to DataFusion.
+        let is_prompt_jev = match f.name.0.as_slice() {
+            [part] => part
+                .as_ident()
+                .is_some_and(|i| i.value.eq_ignore_ascii_case("prompt_jev")),
+            _ => false,
+        };
+        if !is_prompt_jev {
             return ControlFlow::Continue(());
         }
         let result = (|| {

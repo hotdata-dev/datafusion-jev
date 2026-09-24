@@ -850,3 +850,44 @@ async fn a_folded_limit_survives_the_filter_split() {
         "rows failing `id > 1` must not be asked about: {asked}"
     );
 }
+
+#[tokio::test]
+async fn quoted_and_uppercase_names_are_the_same_function() {
+    let mock = Arc::new(Mock::default());
+    let result = run(
+        mock.clone(),
+        "SELECT \"prompt_jev\"('a', 'q') AS a, PROMPT_JEV('a', 'q') AS b, \"PROMPT_JEV\"('a', 'q') AS c",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert!(display(&result).contains("0.9"));
+}
+
+#[tokio::test]
+async fn oversized_instructions_and_labels_fail_at_plan_time() {
+    let long_q = "q".repeat(5_000);
+    let long_label = "L".repeat(300);
+    let long_desc = "d".repeat(2_000);
+    for (sql, needle) in [
+        (
+            format!("SELECT prompt_jev('a', '{long_q}')"),
+            "4000 characters",
+        ),
+        (
+            format!("SELECT prompt_jev('a', 'q', choice := ['{long_label}', 'b'])"),
+            "labels are limited",
+        ),
+        (
+            format!(
+                "SELECT prompt_jev('a', 'q', choice := [{{label: 'a', description: '{long_desc}'}}, 'b'])"
+            ),
+            "descriptions to 1024",
+        ),
+    ] {
+        let mock = Arc::new(Mock::default());
+        let err = run(mock.clone(), &sql).await.err().unwrap().to_string();
+        assert!(err.contains(needle), "{needle}: {err}");
+        assert!(mock.calls.lock().unwrap().is_empty());
+    }
+}
