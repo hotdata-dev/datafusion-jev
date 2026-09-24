@@ -3,7 +3,8 @@ use crate::names::INTERNAL_FUNCTION;
 use datafusion::{
     common::{Result, plan_datafusion_err},
     sql::sqlparser::ast::{
-        self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, Value,
+        self, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+        ObjectName, Value,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -267,18 +268,17 @@ pub fn rewrite_statement(statement: &mut ast::Statement) -> Result<()> {
             let (input, q) = parse_call(f)?;
             q.validate()?;
             let config = serde_json::to_string(&q).map_err(|e| plan_datafusion_err!("{e}"))?;
-            let FunctionArguments::List(args) = &mut f.args else {
-                return Err(plan_datafusion_err!(
-                    "prompt_jev requires input and instructions"
-                ));
-            };
             f.name = ObjectName::from(vec![Ident::new(INTERNAL_FUNCTION)]);
-            args.args = vec![
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(input)),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    Value::SingleQuotedString(config).into(),
-                ))),
-            ];
+            f.args = FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(input)),
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                        Value::SingleQuotedString(config).into(),
+                    ))),
+                ],
+                clauses: vec![],
+            });
             Ok(())
         })();
         match result {
